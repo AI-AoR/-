@@ -1,7 +1,12 @@
 /*
- * 智能门锁完整程序（软串口版）
- * 功能：指纹(D6/D7) + 键盘密码 + 蓝牙(D8/D10) 开锁
- * 舵机(D9)，蜂鸣器(D13)
+ * 智能门锁 - 最终稳定版（内存优化）
+ * 指纹：硬件串口(D0/D1)
+ * 蓝牙：软串口(D8/D10)
+ * 舵机：D9，蜂鸣器：D13
+ * 键盘：行 A0~A3，列 D2~D5（实际接线列顺序为 D5,D4,D3,D2）
+ * 
+ * 上传前必须断开指纹模块VCC，上传后接回
+ * 调试信息通过蓝牙发送至手机，无需打开串口监视器
  */
 
 #include <Keypad.h>
@@ -12,11 +17,11 @@
 const int SERVO_PIN = 9;
 const int BUZZER_PIN = 13;
 
-// 键盘引脚
+// 键盘：行接 A0~A3，列接 D2~D5（但实际顺序反了，所以列引脚数组反过来）
 const byte ROWS = 4;
 const byte COLS = 4;
-byte rowPins[ROWS] = {2, 3, 4, 5};
-byte colPins[COLS] = {14, 15, 16, 17};  // A0=14, A1=15, A2=16, A3=17
+byte rowPins[ROWS] = {14, 15, 16, 17};      // A0, A1, A2, A3
+byte colPins[COLS] = {5, 4, 3, 2};          // 因为列线接反了，所以顺序反过来
 
 char keys[ROWS][COLS] = {
   {'1','2','3','A'},
@@ -26,243 +31,227 @@ char keys[ROWS][COLS] = {
 };
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-// 指纹模块（软串口 D6/D7）
-SoftwareSerial fingerSerial(6, 7);
-Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
+// 指纹模块（硬件串口）
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&Serial);
 
-// 蓝牙模块（软串口 D8/D10）
+// 蓝牙模块（软串口）
 SoftwareSerial bluetooth(8, 10);
 
-// 密码设置
-const String CORRECT_PASSWORD = "123456";
+// 密码及锁定
+const String PASSWORD = "123456";
 const int MAX_ATTEMPTS = 3;
-const unsigned long LOCKOUT_TIME = 300000;  // 5分钟
+const unsigned long LOCKOUT_TIME = 300000;
+String inputPwd = "";
+int wrongCount = 0;
+unsigned long lockStart = 0;
+bool locked = false;
 
-String inputPassword = "";
-int wrongAttempts = 0;
-unsigned long lockoutStartTime = 0;
-bool isLocked = false;
-
-// ==================== 舵机控制（手动PWM） ====================
-void setServoAngle(int angle) {
-  int pulseWidth = map(angle, 0, 180, 500, 2480);
-  for (int i = 0; i < 50; i++) {
-    digitalWrite(SERVO_PIN, HIGH);
-    delayMicroseconds(pulseWidth);
-    digitalWrite(SERVO_PIN, LOW);
-    delayMicroseconds(20000 - pulseWidth);
-  }
+// ==================== 调试输出（通过蓝牙发送到手机） ====================
+void debugPrint(const __FlashStringHelper* msg) {
+  bluetooth.print(msg);
+}
+void debugPrintln(const __FlashStringHelper* msg) {
+  bluetooth.println(msg);
+}
+void debugPrint(String msg) {
+  bluetooth.print(msg);
+}
+void debugPrintln(String msg) {
+  bluetooth.println(msg);
+}
+void debugPrint(char c) {
+  bluetooth.print(c);
 }
 
+// ==================== 舵机控制（手动PWM） ====================
+void setServo(int angle) {
+  int pw = map(angle, 0, 180, 500, 2480);
+  for (int i = 0; i < 50; i++) {
+    digitalWrite(SERVO_PIN, HIGH);
+    delayMicroseconds(pw);
+    digitalWrite(SERVO_PIN, LOW);
+    delayMicroseconds(20000 - pw);
+  }
+}
 void initServo() {
   pinMode(SERVO_PIN, OUTPUT);
-  setServoAngle(0);
-  Serial.println(F("舵机初始化完成（0度）"));
+  setServo(0);
 }
 
 // ==================== 蜂鸣器 ====================
-void buzzerInit() {
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-}
-
 void beepShort() {
   digitalWrite(BUZZER_PIN, HIGH);
-  delay(100);
+  delay(80);
   digitalWrite(BUZZER_PIN, LOW);
 }
-
 void beepLong() {
   digitalWrite(BUZZER_PIN, HIGH);
-  delay(500);
+  delay(400);
   digitalWrite(BUZZER_PIN, LOW);
 }
-
 void beepDouble() {
-  beepShort();
-  delay(100);
-  beepShort();
+  beepShort(); delay(100); beepShort();
 }
 
-// ==================== 开锁动作 ====================
-void unlockDoor() {
-  Serial.println(F("✅ 验证成功！门锁已打开！"));
+// ==================== 开锁 ====================
+void unlock() {
+  debugPrintln(F("✅ 验证成功！门锁已打开！"));
   beepShort();
-  setServoAngle(90);
+  setServo(90);
   delay(2000);
-  setServoAngle(0);
-  Serial.println(F("🔒 门锁已关闭"));
-  wrongAttempts = 0;
+  setServo(0);
+  debugPrintln(F("🔒 门锁已关闭"));
+  wrongCount = 0;
 }
 
 // ==================== 锁定逻辑 ====================
-void checkLockout() {
-  if (wrongAttempts >= MAX_ATTEMPTS) {
-    isLocked = true;
-    lockoutStartTime = millis();
-    Serial.println(F("⛔ 错误次数过多，系统已锁定5分钟！"));
+void checkLock() {
+  if (wrongCount >= MAX_ATTEMPTS) {
+    locked = true;
+    lockStart = millis();
+    debugPrintln(F("⛔ 错误次数过多，系统已锁定5分钟！"));
     beepDouble();
   }
 }
-
-void updateLockout() {
-  if (isLocked && (millis() - lockoutStartTime >= LOCKOUT_TIME)) {
-    isLocked = false;
-    wrongAttempts = 0;
-    Serial.println(F("🔓 锁定时间结束，系统已解锁"));
+void updateLock() {
+  if (locked && (millis() - lockStart >= LOCKOUT_TIME)) {
+    locked = false;
+    wrongCount = 0;
+    debugPrintln(F("🔓 锁定时间结束，系统已解锁"));
     beepShort();
   }
 }
 
 // ==================== 密码验证 ====================
 void checkPassword() {
-  if (isLocked) return;
-  
+  if (locked) return;
   char key = keypad.getKey();
-  if (key) {
-    Serial.print(key);
-    beepShort();
-    
-    if (key == '#') {
-      Serial.println();
-      Serial.print(F("输入的密码是："));
-      Serial.println(inputPassword);
-      if (inputPassword == CORRECT_PASSWORD) {
-        unlockDoor();
-        inputPassword = "";
-      } else {
-        Serial.println(F("❌ 密码错误，请重试！"));
-        beepLong();
-        wrongAttempts++;
-        Serial.print(F("错误次数："));
-        Serial.println(wrongAttempts);
-        inputPassword = "";
-        checkLockout();
-      }
+  if (!key) return;
+  
+  debugPrint(key);
+  beepShort();
+
+  if (key == '#') {
+    debugPrintln("");
+    debugPrint(F("输入的密码："));
+    debugPrintln(inputPwd);
+    if (inputPwd == PASSWORD) {
+      unlock();
+    } else {
+      debugPrintln(F("❌ 密码错误！"));
+      beepLong();
+      wrongCount++;
+      checkLock();
     }
-    else if (key == '*') {
-      inputPassword = "";
-      Serial.println(F(" (已清除)"));
-    }
-    else {
-      if (inputPassword.length() < 6) {
-        inputPassword += key;
-        if (inputPassword.length() == 6) {
-          Serial.println();
-          Serial.println(F("已输入6位密码，请按#确认"));
-        }
-      } else {
-        Serial.println();
-        Serial.println(F("⚠️ 已输入6位，如需修改请按*清除后重新输入"));
+    inputPwd = "";
+  } else if (key == '*') {
+    inputPwd = "";
+    debugPrintln(F(" (已清除)"));
+  } else {
+    if (inputPwd.length() < 6) {
+      inputPwd += key;
+      if (inputPwd.length() == 6) {
+        debugPrintln(F(" (已输入6位，请按#确认)"));
       }
+    } else {
+      debugPrintln(F(" (已达6位，请按#或*)"));
     }
   }
 }
 
 // ==================== 指纹验证 ====================
 void checkFingerprint() {
-  if (isLocked) return;
+  if (locked) return;
+  uint8_t r = finger.getImage();
+  if (r != FINGERPRINT_OK) return;
   
-  uint8_t result = finger.getImage();
-  if (result != FINGERPRINT_OK) return;
-  
-  result = finger.image2Tz();
-  if (result != FINGERPRINT_OK) {
-    Serial.println(F("⚠️ 指纹图像无效，请重新按压"));
+  r = finger.image2Tz();
+  if (r != FINGERPRINT_OK) {
+    debugPrintln(F("⚠️ 指纹图像无效"));
     return;
   }
   
-  result = finger.fingerSearch();
-  if (result == FINGERPRINT_OK) {
-    Serial.print(F("🔓 指纹验证成功！用户ID："));
-    Serial.println(finger.fingerID);
-    unlockDoor();
-  } else if (result == FINGERPRINT_NOTFOUND) {
-    Serial.println(F("❌ 指纹验证失败，未找到匹配指纹"));
+  r = finger.fingerSearch();
+  if (r == FINGERPRINT_OK) {
+    debugPrint(F("🔓 指纹验证成功！用户ID："));
+    debugPrintln(String(finger.fingerID));
+    unlock();
+  } else if (r == FINGERPRINT_NOTFOUND) {
+    debugPrintln(F("❌ 指纹验证失败"));
     beepLong();
-    wrongAttempts++;
-    Serial.print(F("错误次数："));
-    Serial.println(wrongAttempts);
-    checkLockout();
+    wrongCount++;
+    checkLock();
   } else {
-    Serial.println(F("⚠️ 指纹识别出错，请重试"));
+    debugPrintln(F("⚠️ 识别错误"));
   }
 }
 
 // ==================== 蓝牙指令 ====================
 void checkBluetooth() {
   if (bluetooth.available()) {
-    // 累积接收所有字节，直到100ms内没有新数据
+    delay(80);
     String cmd = "";
-    unsigned long lastTime = millis();
-    while (millis() - lastTime < 100) {
-      if (bluetooth.available()) {
-        char c = bluetooth.read();
-        cmd += c;
-        lastTime = millis();  // 每收到一个字节就重置计时
-      }
+    while (bluetooth.available()) {
+      cmd += (char)bluetooth.read();
     }
-    cmd.trim();  // 去掉首尾的空白字符（换行、回车、空格）
-    
-    // 统一转为小写比较（兼容大小写）
+    cmd.trim();
     cmd.toLowerCase();
     
-    // 打印收到的指令（带换行，方便调试）
-    Serial.print(F("蓝牙收到: ["));
-    Serial.print(cmd);
-    Serial.println(F("]"));
+    // 过滤纯数字（避免显示键盘输入的回显）
+    bool isAllDigits = true;
+    for (char c : cmd) {
+      if (!isDigit(c)) { isAllDigits = false; break; }
+    }
+    if (cmd.length() == 0 || isAllDigits) return;
     
     if (cmd == "o" || cmd == "open") {
-      Serial.println(F("📱 收到蓝牙开锁指令"));
-      unlockDoor();
+      debugPrintln(F("📱 收到蓝牙开锁指令"));
+      unlock();
+    } else {
+      debugPrint(F("未知指令: "));
+      debugPrintln(cmd);
     }
   }
 }
 
-// ==================== 指纹模块初始化 ====================
+// ==================== 指纹初始化 ====================
 void initFingerprint() {
-  Serial.println(F("正在初始化指纹模块（软串口 D6/D7）..."));
-  // 根据你的模块实际波特率修改（常见57600或9600）
-  finger.begin(57600);
+  debugPrintln(F("正在初始化指纹模块..."));
+  finger.begin(57600);  // 若失败改为9600
   if (finger.verifyPassword()) {
-    Serial.println(F("✅ 指纹模块连接成功！"));
+    debugPrintln(F("✅ 指纹模块连接成功"));
     finger.getTemplateCount();
-    Serial.print(F("📌 当前指纹库中有 "));
-    Serial.print(finger.templateCount);
-    Serial.println(F(" 个指纹"));
+    debugPrint(F("📌 指纹库数量: "));
+    debugPrintln(String(finger.templateCount));
   } else {
-    Serial.println(F("❌ 指纹模块连接失败！"));
-    Serial.println(F("请检查：1. 接线 TX→D6, RX→D7  2. 独立供电且共地  3. 波特率"));
-    while (1);
+    debugPrintln(F("❌ 指纹模块连接失败！请检查接线和波特率"));
+    while (1) { delay(1000); }
   }
 }
 
 // ==================== 初始化 ====================
 void setup() {
-  Serial.begin(9600);
-  while (!Serial);
-  delay(100);
-  
-  bluetooth.begin(9600);
-  buzzerInit();
+  Serial.begin(9600);           // 硬件串口给指纹
+  bluetooth.begin(9600);        // 蓝牙软串口
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
   initServo();
   initFingerprint();
   
-  Serial.println(F("\n========================================"));
-  Serial.println(F("   指纹密码蓝牙智能门锁系统 v3.0"));
-  Serial.println(F("========================================"));
-  Serial.println(F("开锁方式："));
-  Serial.println(F("  1. 密码：123456 然后按 #"));
-  Serial.println(F("  2. 指纹：按压已录入的手指"));
-  Serial.println(F("  3. 蓝牙：发送 O 或 open"));
-  Serial.println(F("按 * 清除密码，按 # 确认"));
-  Serial.println(F("========================================\n"));
+  debugPrintln(F("\n======================================"));
+  debugPrintln(F("   智能门锁系统 v3.0 (硬件串口指纹)"));
+  debugPrintln(F("======================================="));
+  debugPrintln(F("开锁方式："));
+  debugPrintln(F("  1. 密码：输入密码，然后按 #"));
+  debugPrintln(F("  2. 指纹：按压已录入的手指"));
+  debugPrintln(F("  3. 蓝牙：发送 O 或 open"));
+  debugPrintln(F("======================================\n"));
   
   beepShort();
 }
 
 void loop() {
-  updateLockout();
+  updateLock();
   checkPassword();
   checkFingerprint();
   checkBluetooth();
